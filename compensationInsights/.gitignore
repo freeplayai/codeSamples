@@ -1,0 +1,4 @@
+.env
+.compensationInsights/
+__pycache__/
+.DS_Store

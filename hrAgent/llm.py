@@ -12,7 +12,40 @@ import anthropic
 from anthropic import NotGiven
 from anthropic.types import ToolUseBlock
 import openai
-from freeplay import Freeplay, RecordPayload, CallInfo, SessionInfo, TraceInfo
+from freeplay import Freeplay, RecordPayload, CallInfo, SessionInfo
+
+
+def _handle_tool_calls(
+    tool_handlers: dict,
+    tool_calls: list[tuple[str, str, dict]],
+    provider: str,
+    context: dict,
+) -> list[dict]:
+    """Execute tool handlers and return provider-formatted result messages."""
+    results = []
+    for call_id, name, args in tool_calls:
+        handler = tool_handlers.get(name)
+        if handler:
+            output = handler(args, context)
+        else:
+            output = json.dumps({"error": f"Unknown tool: {name}"})
+        results.append((call_id, output))
+
+    if provider == "anthropic":
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": cid, "content": res}
+                    for cid, res in results
+                ],
+            }
+        ]
+
+    return [
+        {"role": "tool", "tool_call_id": cid, "content": res}
+        for cid, res in results
+    ]
 
 
 def call_and_record(
@@ -23,21 +56,17 @@ def call_and_record(
     variables: dict,
     session_info: SessionInfo,
     tool_handlers: dict[str, Any] | None = None,
-    tool_definitions: list | None = None,
     history: list | None = None,
-    trace_info: TraceInfo | None = None,
+    parent_id: str | None = None,
 ) -> dict:
-    """Fetch prompt from Freeplay, call the LLM, and record each call.
-
-    Each LLM invocation is recorded individually to Freeplay.
-    For tool-call turns the recorded response is the tool call itself.
-    The loop continues until the LLM returns a plain text response.
-    """
+    """Fetch prompt from Freeplay, call the LLM, record, and loop on tool calls
+    until the model returns a plain-text response."""
     tool_handlers = tool_handlers or {}
     history = list(history or [])
+    context = {"parent_id": parent_id, "session_info": session_info}
+    messages = None
 
     while True:
-        # 1. Fetch & format prompt with the latest history
         formatted_prompt = fp_client.prompts.get_formatted(
             project_id=project_id,
             template_name=template_name,
@@ -47,18 +76,24 @@ def call_and_record(
         )
 
         provider = formatted_prompt.prompt_info.provider
-        tool_schema = formatted_prompt.tool_schema or tool_definitions
-        tool_schema = _format_tools_for_provider(tool_schema, provider) if tool_schema else None
+        tool_schema = formatted_prompt.tool_schema
 
-        # 2. Call the LLM
+        # On the first iteration, seed the messages list from the formatted
+        # prompt.  On subsequent iterations (tool-use loops) we keep building
+        # on `messages` directly so the user message isn't re-injected by the
+        # template — but we still call get_formatted above so Freeplay
+        # recording and prompt metadata stay up to date.
+        if messages is None:
+            messages = list(formatted_prompt.llm_prompt)
+
         start = time.time()
         if provider == "anthropic":
             response_text, assistant_msg, tool_calls = _call_anthropic(
-                formatted_prompt, tool_schema,
+                formatted_prompt, tool_schema, messages,
             )
         elif provider == "openai":
             response_text, assistant_msg, tool_calls = _call_openai(
-                formatted_prompt, tool_schema,
+                formatted_prompt, tool_schema, messages,
             )
         else:
             raise ValueError(
@@ -67,7 +102,6 @@ def call_and_record(
             )
         end = time.time()
 
-        # 3. Record THIS call to Freeplay
         all_messages = formatted_prompt.all_messages(assistant_msg)
         fp_client.recordings.create(
             RecordPayload(
@@ -80,38 +114,21 @@ def call_and_record(
                     formatted_prompt.prompt_info, start, end
                 ),
                 tool_schema=tool_schema,
-                trace_info=trace_info,
+                parent_id=parent_id,
             )
         )
 
-        # 4. Add assistant message to history
+        messages.append(assistant_msg)
         history.append(assistant_msg)
 
-        # 5. If no tool calls, we're done
         if not tool_calls:
             break
 
-        # 6. Execute tools and add results to history
-        results = [
-            (cid, _execute_tool(tool_handlers, name, args))
-            for cid, name, args in tool_calls
-        ]
-
-        if provider == "anthropic":
-            history.append({
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": cid, "content": res}
-                    for cid, res in results
-                ],
-            })
-        elif provider == "openai":
-            for cid, res in results:
-                history.append({
-                    "role": "tool",
-                    "tool_call_id": cid,
-                    "content": res,
-                })
+        result_msgs = _handle_tool_calls(
+            tool_handlers, tool_calls, provider, context,
+        )
+        messages.extend(result_msgs)
+        history.extend(result_msgs)
 
     return {
         "llm_response": response_text,
@@ -119,60 +136,10 @@ def call_and_record(
     }
 
 
-def _format_tools_for_provider(tools: list, provider: str) -> list:
-    """Convert normalized tool definitions (name, description, parameters)
-    to the format expected by each provider.
-
-    Mirrors the conversion logic in Freeplay's BoundPrompt.__format_tool_schema.
-    If tools are already in a provider-specific format they pass through unchanged.
-    """
-    if not tools:
-        return tools
-    sample = tools[0]
-
-    # Already provider-formatted (e.g. from formatted_prompt.tool_schema)
-    if provider == "openai" and sample.get("type") == "function":
-        return tools
-    if provider == "anthropic" and "input_schema" in sample:
-        return tools
-
-    # Normalized format → provider-specific
-    if provider == "openai":
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t["parameters"],
-                },
-            }
-            for t in tools
-        ]
-    if provider == "anthropic":
-        return [
-            {
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "input_schema": t["parameters"],
-            }
-            for t in tools
-        ]
-    return tools
-
-
-def _execute_tool(tool_handlers: dict, name: str, args: dict) -> str:
-    handler = tool_handlers.get(name)
-    if handler:
-        return handler(args)
-    return json.dumps({"error": f"Unknown tool: {name}"})
-
-
-# ── Anthropic ────────────────────────────────────────────────────────
-
-
 def _call_anthropic(
-    formatted_prompt, tool_schema,
+    formatted_prompt,
+    tool_schema,
+    messages=None,
 ) -> tuple[str, dict, list[tuple[str, str, dict]]]:
     """Single Anthropic API call. Returns (text, assistant_msg, tool_calls)."""
     client = anthropic.Anthropic()
@@ -186,26 +153,26 @@ def _call_anthropic(
         call_kwargs["tools"] = tool_schema
 
     response = client.messages.create(
-        messages=formatted_prompt.llm_prompt, **call_kwargs,
+        messages=messages if messages is not None else formatted_prompt.llm_prompt,
+        **call_kwargs,
     )
 
     assistant_msg = {"role": "assistant", "content": response.content}
     tool_calls = [
-        (b.id, b.name, b.input)
-        for b in response.content if isinstance(b, ToolUseBlock)
+        (b.id, b.name, b.input) for b in response.content if isinstance(b, ToolUseBlock)
     ]
     response_text = "".join(
-        b.text for b in response.content
+        b.text
+        for b in response.content
         if getattr(b, "type", None) == "text" and b.text
     )
     return response_text, assistant_msg, tool_calls
 
 
-# ── OpenAI ───────────────────────────────────────────────────────────
-
-
 def _call_openai(
-    formatted_prompt, tool_schema,
+    formatted_prompt,
+    tool_schema,
+    messages=None,
 ) -> tuple[str, Any, list[tuple[str, str, dict]]]:
     """Single OpenAI API call. Returns (text, assistant_msg, tool_calls)."""
     client = openai.OpenAI()
@@ -218,7 +185,8 @@ def _call_openai(
         call_kwargs["tools"] = tool_schema
 
     response = client.chat.completions.create(
-        messages=formatted_prompt.llm_prompt, **call_kwargs,
+        messages=messages if messages is not None else formatted_prompt.llm_prompt,
+        **call_kwargs,
     )
 
     message = response.choices[0].message

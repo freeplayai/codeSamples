@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from freeplay import Freeplay
 
 from data import init_db, DB_PATH
-from tools import TOOL_DEFINITIONS, TOOL_HANDLERS
+from tools import TOOL_HANDLERS, make_report_tool
 from llm import call_and_record
 
 load_dotenv(override=True)
@@ -27,6 +27,12 @@ def run_agent():
         init_db()
 
     session = fp_client.sessions.create()
+    tool_handlers = {
+        **TOOL_HANDLERS,
+        "generate_report": make_report_tool(
+            fp_client, PROJECT_ID, ENVIRONMENT, session.session_info,
+        ),
+    }
 
     print("=" * 60)
     print("  HR Meeting Prep Agent")
@@ -50,8 +56,16 @@ def run_agent():
             print("Goodbye!")
             break
 
-        trace_info = session.create_trace(input=user_input, agent_name="HR-Manager")
+        history.append({"role": "user", "content": user_input})
 
+        ###############################################
+        # Create a Freepaly trace to wrap the Agent execution
+        ###############################################
+        trace_info = session.create_trace(input=user_input, agent_name="HR-Agent")
+
+        ###############################################
+        # Call the LLM and record the execution
+        ###############################################
         result = call_and_record(
             fp_client=fp_client,
             project_id=PROJECT_ID,
@@ -59,16 +73,21 @@ def run_agent():
             environment=ENVIRONMENT,
             variables={"user_input": user_input},
             session_info=session.session_info,
-            tool_handlers=TOOL_HANDLERS,
-            tool_definitions=TOOL_DEFINITIONS,
+            tool_handlers=tool_handlers,
             history=history,
-            trace_info=trace_info,
+            parent_id=trace_info.trace_id,
         )
 
+        ###############################################
+        # Record the output of the Agent execution
+        ###############################################
         trace_info.record_output(PROJECT_ID, result["llm_response"])
 
         print(f"\nAssistant: {result['llm_response']}\n")
 
+        ###############################################
+        # Update the history with the new messages
+        ###############################################
         history = [msg for msg in result["all_messages"] if msg["role"] != "system"]
 
 

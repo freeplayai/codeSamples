@@ -1,116 +1,13 @@
-"""Tool definitions and implementations for the HR agent."""
+"""Tool implementations for the HR agent.
+
+Tool schemas (names, descriptions, parameters) are managed in the Freeplay UI
+on the HR-Manager prompt template. This file only contains the runtime handlers.
+"""
 
 import json
+
 from data import get_connection
-
-# --- Tool schemas (provider-agnostic, matches Freeplay's ToolSchema format) ---
-
-TOOL_DEFINITIONS = [
-    {
-        "name": "lookup_employee",
-        "description": (
-            "Look up an employee by name (partial match supported). "
-            "Returns their profile info including title, department, manager, start date, and location."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Full or partial name of the employee to look up.",
-                }
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "get_performance_reviews",
-        "description": (
-            "Get performance review history for an employee. "
-            "Returns ratings, summaries, and areas for growth for each review period."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "employee_id": {
-                    "type": "string",
-                    "description": "The employee ID (e.g. E001).",
-                }
-            },
-            "required": ["employee_id"],
-        },
-    },
-    {
-        "name": "get_goals",
-        "description": (
-            "Get current goals and their progress for an employee. "
-            "Returns each goal with its status (On Track, At Risk, Off Track, Complete, Not Started) and progress percentage."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "employee_id": {
-                    "type": "string",
-                    "description": "The employee ID (e.g. E001).",
-                }
-            },
-            "required": ["employee_id"],
-        },
-    },
-    {
-        "name": "get_time_off",
-        "description": (
-            "Get PTO balance and upcoming scheduled time off for an employee."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "employee_id": {
-                    "type": "string",
-                    "description": "The employee ID (e.g. E001).",
-                }
-            },
-            "required": ["employee_id"],
-        },
-    },
-    {
-        "name": "get_compensation",
-        "description": (
-            "Get compensation details for an employee including salary band, "
-            "current salary, band range, last adjustment date, and next equity vesting date."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "employee_id": {
-                    "type": "string",
-                    "description": "The employee ID (e.g. E001).",
-                }
-            },
-            "required": ["employee_id"],
-        },
-    },
-    {
-        "name": "list_direct_reports",
-        "description": (
-            "List all direct reports for a given manager. "
-            "Accepts a manager name (partial match) or manager ID."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "manager": {
-                    "type": "string",
-                    "description": "Manager name (partial match) or manager ID (e.g. M001).",
-                }
-            },
-            "required": ["manager"],
-        },
-    },
-]
-
-
-# --- Tool implementations ---
+from llm import call_and_record
 
 
 def lookup_employee(name: str) -> str:
@@ -168,10 +65,12 @@ def get_time_off(employee_id: str) -> str:
     conn.close()
     if not balance:
         return json.dumps({"error": f"No time-off data found for {employee_id}."})
-    return json.dumps({
-        "pto_remaining_days": balance["pto_remaining_days"],
-        "upcoming": [dict(r) for r in upcoming],
-    })
+    return json.dumps(
+        {
+            "pto_remaining_days": balance["pto_remaining_days"],
+            "upcoming": [dict(r) for r in upcoming],
+        }
+    )
 
 
 def get_compensation(employee_id: str) -> str:
@@ -190,11 +89,16 @@ def list_direct_reports(manager: str) -> str:
     conn = get_connection()
     # Try matching by ID first, then by name
     if manager.upper().startswith("M"):
-        manager_row = conn.execute("SELECT id, name FROM managers WHERE id = ?", (manager.upper(),)).fetchone()
+        manager_row = conn.execute(
+            "SELECT id, name FROM managers WHERE id = ?", (manager.upper(),)
+        ).fetchone()
     else:
         manager_row = None
     if not manager_row:
-        manager_row = conn.execute("SELECT id, name FROM managers WHERE LOWER(name) LIKE LOWER(?)", (f"%{manager}%",)).fetchone()
+        manager_row = conn.execute(
+            "SELECT id, name FROM managers WHERE LOWER(name) LIKE LOWER(?)",
+            (f"%{manager}%",),
+        ).fetchone()
     if not manager_row:
         conn.close()
         return json.dumps({"error": f"No manager found matching '{manager}'."})
@@ -203,18 +107,45 @@ def list_direct_reports(manager: str) -> str:
         (manager_row["id"],),
     ).fetchall()
     conn.close()
-    return json.dumps({
-        "manager": dict(manager_row),
-        "direct_reports": [dict(r) for r in rows],
-    })
+    return json.dumps(
+        {
+            "manager": dict(manager_row),
+            "direct_reports": [dict(r) for r in rows],
+        }
+    )
 
 
-# Dispatch map
+REPORT_TEMPLATE_NAME = "HR-Report-Generator"
+
+def make_report_tool(fp_client, project_id, environment, session_info):
+    """Create a generate_report tool handler bound to the current session."""
+
+    def generate_report(args: dict, context: dict) -> str:
+        result = call_and_record(
+            fp_client=fp_client,
+            project_id=project_id,
+            template_name=REPORT_TEMPLATE_NAME,
+            environment=environment,
+            variables={
+                "report_type": args.get("report_type", "meeting_agenda"),
+                "context": args.get("context", ""),
+            },
+            session_info=session_info,
+            parent_id=context.get("parent_id"),
+        )
+        return result["llm_response"]
+
+    return generate_report
+
+
+# Dispatch map: every handler has signature (args: dict, context: dict) -> str
 TOOL_HANDLERS = {
-    "lookup_employee": lambda args: lookup_employee(args["name"]),
-    "get_performance_reviews": lambda args: get_performance_reviews(args["employee_id"]),
-    "get_goals": lambda args: get_goals(args["employee_id"]),
-    "get_time_off": lambda args: get_time_off(args["employee_id"]),
-    "get_compensation": lambda args: get_compensation(args["employee_id"]),
-    "list_direct_reports": lambda args: list_direct_reports(args["manager"]),
+    "lookup_employee": lambda args, context: lookup_employee(args["name"]),
+    "get_performance_reviews": lambda args, context: get_performance_reviews(
+        args["employee_id"]
+    ),
+    "get_goals": lambda args, context: get_goals(args["employee_id"]),
+    "get_time_off": lambda args, context: get_time_off(args["employee_id"]),
+    "get_compensation": lambda args, context: get_compensation(args["employee_id"]),
+    "list_direct_reports": lambda args, context: list_direct_reports(args["manager"]),
 }
